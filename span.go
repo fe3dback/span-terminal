@@ -6,18 +6,19 @@ import (
 )
 
 var globalId spanID
-var createMux sync.Mutex
+var globalSpanMux sync.RWMutex
 
 type (
 	spanID int64
 	spans  map[spanID]*Span
 
 	Span struct {
-		term   *Terminal
-		parent *Span
-		child  spans
-		id     spanID
-		title  string
+		term    *Terminal
+		parent  *Span
+		child   spans
+		id      spanID
+		title   string
+		percent int
 
 		startAt time.Time
 		endAt   time.Time
@@ -26,8 +27,8 @@ type (
 )
 
 func newSpan(term *Terminal, prev *Span, title string) *Span {
-	createMux.Lock()
-	defer createMux.Unlock()
+	globalSpanMux.Lock()
+	defer globalSpanMux.Unlock()
 
 	globalId++
 	currentTime := time.Now()
@@ -54,24 +55,49 @@ func (s *Span) WriteMessage(result string) {
 	if s == nil {
 		return
 	}
+	if s.isEnd {
+		return
+	}
 
 	s.write(newAction(s, actionTypeMessage, result))
 }
 
-func (s *Span) End(result string) {
+func (s *Span) UpdateProgress(progress float64) {
 	if s == nil {
 		return
 	}
+	if s.isEnd {
+		return
+	}
 
-	s.WriteMessage(result)
+	if progress < 0 {
+		progress = 0
+	}
+
+	if progress > 1 {
+		progress = 1
+	}
+
+	s.percent = int(progress * 100)
+}
+
+func (s *Span) End() {
+	if s == nil {
+		return
+	}
+	if s.isEnd {
+		return
+	}
+
 	s.write(newAction(s, actionTypeSpanEnd, ""))
 
 	s.endAt = time.Now()
+	s.percent = 100
 	s.isEnd = true
 }
 
 func (s *Span) write(act action) {
-	if s == nil {
+	if s.term.finished {
 		return
 	}
 
@@ -92,4 +118,17 @@ func (s *Span) getParent() *Span {
 
 func (s *Span) getChild() map[spanID]*Span {
 	return s.child
+}
+
+func (s *Span) hasActiveChild() bool {
+	globalSpanMux.RLock()
+	defer globalSpanMux.RUnlock()
+
+	for _, span := range s.child {
+		if !span.isFinished() {
+			return true
+		}
+	}
+
+	return false
 }

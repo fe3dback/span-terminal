@@ -15,5 +15,13 @@ func StartSpan(ctx context.Context, title string) (context.Context, *Span) {
 		return ctx, nil
 	}
 
-	return globalTerminal.Span(ctx, title)
+	return globalTerminal.span(ctx, title)
+}
+
+func Shutdown() {
+	if globalTerminal == nil {
+		return
+	}
+
+	globalTerminal.shutdown()
 }
