@@ -26,6 +26,8 @@ const maxLineLength = 80
 // max updates rate
 const updateInterval = time.Millisecond * 5
 
+const maxDepth = 2
+
 type (
 	Terminal struct {
 		controlCtx context.Context
@@ -181,11 +183,19 @@ func (t *Terminal) renderSpans(buf *bytes.Buffer, list spans) {
 		}
 
 		if span.isFinished() {
-			buf.Write(t.outputDone(span))
+			buf.WriteString(t.outputDone(span) + "\n")
 			continue
 		}
 
-		buf.Write(t.outputProcess(span, !span.hasActiveChild()))
+		if span.depth >= maxDepth {
+			buf.WriteString("" +
+				t.outputProcess(span, !span.hasActiveChild()) +
+				" | " +
+				t.outputLastLine(span) + "\n")
+			continue
+		}
+
+		buf.WriteString(t.outputProcess(span, !span.hasActiveChild()) + "\n")
 
 		if span.hasActiveChild() {
 			t.renderSpans(buf, span.child)
@@ -201,18 +211,16 @@ func (t *Terminal) renderSpans(buf *bytes.Buffer, list spans) {
 		}
 
 		for _, s := range cont.content() {
-			buf.Write(t.outputLine(s))
+			buf.WriteString(t.outputLine(s) + "\n")
 		}
 	}
 }
 
-func (t *Terminal) outputDone(s *Span) []byte {
-	return []byte(
-		styleStatusDone.Render(fmt.Sprintf("[ %5s ] %s",
-			t.formatDuration(s),
-			s.title,
-		)) + "\n",
-	)
+func (t *Terminal) outputDone(s *Span) string {
+	return styleStatusDone.Render(fmt.Sprintf("[ %5s ] %s",
+		t.formatDuration(s),
+		s.title,
+	))
 }
 
 func (t *Terminal) formatDuration(s *Span) string {
@@ -225,7 +233,7 @@ func (t *Terminal) formatDuration(s *Span) string {
 	return fmt.Sprintf("%dms", took.Milliseconds())
 }
 
-func (t *Terminal) outputProcess(s *Span, active bool) []byte {
+func (t *Terminal) outputProcess(s *Span, active bool) string {
 	text := s.title
 	pb := fmt.Sprintf("[ %4d%% ] ", s.percent)
 
@@ -237,18 +245,22 @@ func (t *Terminal) outputProcess(s *Span, active bool) []byte {
 	}
 
 	if active {
-		return []byte(percents + styleStatusActive.Render(text) + "\n")
+		return percents + styleStatusActive.Render(text)
 	}
 
-	return []byte(percents + styleStatusWait.Render(text) + "\n")
+	return percents + styleStatusWait.Render(text)
 }
 
-func (t *Terminal) outputLine(line string) []byte {
+func (t *Terminal) outputLastLine(s *Span) string {
+	return styleLogs.Render(s.lastLine)
+}
+
+func (t *Terminal) outputLine(line string) string {
 	if len(line) > maxLineLength {
 		line = string(line[:maxLineLength-2]) + ".."
 	}
 
-	return []byte(styleStatusActive.Render("  | ") + styleLogs.Render(line) + "\n")
+	return styleStatusActive.Render("  | ") + styleLogs.Render(line)
 }
 
 func (t *Terminal) Init() tea.Cmd {

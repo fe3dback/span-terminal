@@ -13,12 +13,14 @@ type (
 	spans  map[spanID]*Span
 
 	Span struct {
-		term    *Terminal
-		parent  *Span
-		child   spans
-		id      spanID
-		title   string
-		percent int
+		term     *Terminal
+		parent   *Span
+		child    spans
+		depth    int
+		id       spanID
+		title    string
+		lastLine string
+		percent  int
 
 		startAt time.Time
 		endAt   time.Time
@@ -36,6 +38,7 @@ func newSpan(term *Terminal, prev *Span, title string) *Span {
 	newSpan := &Span{
 		term:    term,
 		parent:  prev,
+		depth:   0,
 		child:   make(spans),
 		id:      globalId,
 		title:   title,
@@ -46,6 +49,7 @@ func newSpan(term *Terminal, prev *Span, title string) *Span {
 
 	if prev != nil {
 		prev.child[newSpan.id] = newSpan
+		newSpan.depth = prev.depth + 1
 	}
 
 	return newSpan
@@ -59,6 +63,7 @@ func (s *Span) WriteMessage(result string) {
 		return
 	}
 
+	s.updateLastLine(result)
 	s.write(newAction(s, actionTypeMessage, result))
 }
 
@@ -94,6 +99,14 @@ func (s *Span) End() {
 	s.endAt = time.Now()
 	s.percent = 100
 	s.isEnd = true
+}
+
+func (s *Span) updateLastLine(result string) {
+	s.lastLine = result
+
+	if s.parent != nil {
+		s.parent.updateLastLine(result)
+	}
 }
 
 func (s *Span) write(act action) {
