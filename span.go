@@ -1,147 +1,150 @@
 package terminal
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
 
-var globalId spanID
-var globalSpanMux sync.RWMutex
+var globalSpanID spanID = 0
+var globalSpanMux sync.Mutex
 
 type (
 	spanID int64
-	spans  map[spanID]*Span
 
 	Span struct {
-		term     *Terminal
-		parent   *Span
-		child    spans
-		depth    int
-		id       spanID
-		title    string
-		lastLine string
-		percent  int
+		id      spanID  // unique spanID
+		parent  *Span   // ref to parent, nil on root spans
+		child   []*Span // refs to all child
+		depth   depth   // 0 = root, +1 for child
+		logical bool    // span will not store logs, and propagate it next to non-logical parent
 
-		startAt time.Time
-		endAt   time.Time
-		isEnd   bool
+		title     string    // span title to display
+		container container // logs container, layout depend on terminal spawner
+		progress  int       // progress in %, 0 .. 100
+
+		changedAt time.Time
+		startAt   time.Time
+		endAt     time.Time
+		finished  bool
+
+		mux sync.RWMutex
 	}
 )
 
-func newSpan(term *Terminal, prev *Span, title string) *Span {
+func newSpan(parent *Span, container container, logical bool) *Span {
 	globalSpanMux.Lock()
 	defer globalSpanMux.Unlock()
 
-	globalId++
-	currentTime := time.Now()
+	globalSpanID++
 
-	newSpan := &Span{
-		term:    term,
-		parent:  prev,
-		depth:   0,
-		child:   make(spans),
-		id:      globalId,
-		title:   title,
-		startAt: currentTime,
-		endAt:   currentTime,
-		isEnd:   false,
+	span := &Span{
+		id:      globalSpanID,
+		parent:  parent,
+		child:   make([]*Span, 0),
+		logical: logical,
+
+		title:     fmt.Sprintf("span #%d", globalSpanID),
+		container: container,
+		progress:  0,
+
+		changedAt: time.Now(),
+		startAt:   time.Now(),
+		endAt:     time.Time{},
+		finished:  false,
 	}
 
-	if prev != nil {
-		prev.child[newSpan.id] = newSpan
-		newSpan.depth = prev.depth + 1
+	if parent != nil {
+		span.depth = parent.depth + 1
+		parent.child = append(parent.child, span)
 	}
 
-	return newSpan
+	return span
 }
 
-func (s *Span) WriteMessage(result string) {
+// Append log to this span
+func (s *Span) Write(src string) {
 	if s == nil {
 		return
 	}
-	if s.isEnd {
+
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if s.logical {
+		// propagate next to physical parent
+		s.parent.Write(src)
 		return
 	}
 
-	s.updateLastLine(result)
-	s.write(newAction(s, actionTypeMessage, result))
+	s.container.write(src)
+	s.propagateChange()
 }
 
+// UpdateProgress get any value between 0 and 1
+// where 1 = 100% and output this progress in terminal
 func (s *Span) UpdateProgress(progress float64) {
 	if s == nil {
 		return
 	}
-	if s.isEnd {
-		return
-	}
 
-	if progress < 0 {
-		progress = 0
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if s.finished {
+		return
 	}
 
 	if progress > 1 {
 		progress = 1
 	}
 
-	s.percent = int(progress * 100)
+	if progress < 0 {
+		progress = 0
+	}
+
+	s.progress = int(progress * 100)
+	s.propagateChange()
 }
 
+// End will close this span
+// It will ignore all other method calls to this span
+// also time took will be calculated after span ending
+// this method will automatically close all child spans (if it`s not closed yet)
 func (s *Span) End() {
 	if s == nil {
 		return
 	}
-	if s.isEnd {
+
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if s.finished {
 		return
 	}
 
-	s.write(newAction(s, actionTypeSpanEnd, ""))
+	for _, subSpan := range s.child {
+		subSpan.End()
+	}
 
+	s.progress = 100
+	s.finished = true
 	s.endAt = time.Now()
-	s.percent = 100
-	s.isEnd = true
+	s.container = newEmptyContainer()
+	s.propagateChange()
 }
 
-func (s *Span) updateLastLine(result string) {
-	s.lastLine = result
+func (s *Span) propagateChange() {
+	if s == nil {
+		return
+	}
+	if s.finished {
+		return
+	}
+
+	s.changedAt = time.Now()
 
 	if s.parent != nil {
-		s.parent.updateLastLine(result)
+		s.parent.propagateChange()
 	}
-}
-
-func (s *Span) write(act action) {
-	if s.term.finished {
-		return
-	}
-
-	s.term.buffer <- act
-}
-
-func (s *Span) isRoot() bool {
-	return s.parent == nil
-}
-
-func (s *Span) isFinished() bool {
-	return s.isEnd
-}
-
-func (s *Span) getParent() *Span {
-	return s.parent
-}
-
-func (s *Span) getChild() map[spanID]*Span {
-	return s.child
-}
-
-func (s *Span) hasActiveChild() bool {
-	globalSpanMux.RLock()
-	defer globalSpanMux.RUnlock()
-
-	for _, span := range s.child {
-		if !span.isFinished() {
-			return true
-		}
-	}
-
-	return false
 }
