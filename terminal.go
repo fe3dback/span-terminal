@@ -1,6 +1,7 @@
 package terminal
 
 import (
+	"bufio"
 	"context"
 	"os"
 	"sync"
@@ -22,10 +23,12 @@ type Terminal struct {
 	writer      *os.File
 	optMaxLines int
 
-	rootSpans   []*Span
-	active      bool
-	watchCtx    context.Context
-	watchCancel func()
+	rootSpans     []*Span
+	active        bool
+	watchCtx      context.Context
+	watchCancel   func()
+	realStdout    *os.File
+	logsContainer container
 
 	mux sync.RWMutex
 }
@@ -35,9 +38,13 @@ func NewTerminal(initializers ...TerminalInitializer) *Terminal {
 		writer:      os.Stdout,
 		optMaxLines: 4,
 
-		rootSpans: make([]*Span, 0),
-		active:    false,
+		rootSpans:     make([]*Span, 0),
+		active:        false,
+		realStdout:    os.Stdout,
+		logsContainer: newMultiLineContainer(6),
 	}
+
+	tm.Output = bufio.NewWriter(t.realStdout)
 
 	for _, initializer := range initializers {
 		initializer(t)
@@ -61,7 +68,18 @@ func (t *Terminal) capture() {
 	t.watchCancel = cancel
 
 	t.active = true
+	go t.redirectAllStdoutToContainer()
 	go t.watch()
+}
+
+func (t *Terminal) redirectAllStdoutToContainer() {
+	bufioStdout(t.watchCtx, func(message bufioMessage) {
+		if message.err != nil {
+			return
+		}
+
+		t.logsContainer.write(string(message.data))
+	})
 }
 
 func (t *Terminal) release() {
@@ -165,13 +183,21 @@ func (t *Terminal) update() {
 	t.mux.Lock()
 	defer t.mux.Unlock()
 
+	// todo: custom terminal output/buffer lib
+
+	// clear
 	tm.Clear()
 	tm.MoveCursor(1, 1)
 
+	// render main logs
+	_, _ = tm.Print(renderMainContainer(t.logsContainer))
+
+	// render top spans
 	for _, rootSpan := range t.rootSpans {
 		spanContent := renderSpanWithOptions(rootSpan) // todo: opts
 		_, _ = tm.Print(spanContent)
 	}
 
+	// output to term
 	tm.Flush()
 }

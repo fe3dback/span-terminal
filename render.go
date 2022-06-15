@@ -10,7 +10,8 @@ type renderOpts struct {
 	maxRootSpans      int    // todo
 	maxChild          int    // will filter only ended todo
 	progressZeroLabel string // should be 3 chars long
-	maxLogLength      int
+	logsMaxLength     int
+	logsPrefix        string
 }
 
 type renderOptInitializer func(*renderOpts)
@@ -24,7 +25,8 @@ func renderSpanWithOptions(span *Span, optsInitializers ...renderOptInitializer)
 		maxRootSpans:      4,
 		maxChild:          8,
 		progressZeroLabel: "...",
-		maxLogLength:      80,
+		logsMaxLength:     80,
+		logsPrefix:        "| ",
 	}
 
 	for _, initializer := range optsInitializers {
@@ -57,7 +59,7 @@ func renderSpanRoot(span *Span, opt *renderOpts) string {
 
 	logs := ""
 	if !span.finished {
-		logs = renderContainer(span, opt) + "\n"
+		logs = renderContainer(span.container, opt) + "\n"
 	}
 
 	return "" +
@@ -142,16 +144,23 @@ func renderSpanPadding(span *Span) string {
 	return strings.Repeat(" ", int(span.depth)) + " "
 }
 
-func renderContainer(span *Span, opt *renderOpts) string {
+func renderContainer(c container, opt *renderOpts) string {
 	logs := ""
 
-	for _, line := range span.container.content() {
-		if len(line) > opt.maxLogLength {
-			line = line[:opt.maxLogLength]
+	for _, line := range c.content() {
+		if len(line) > opt.logsMaxLength {
+			line = line[:opt.logsMaxLength]
 		}
 
-		logs += "| " + line + "\n"
+		logs += opt.logsPrefix + line + "\n"
 	}
 
 	return styleLogs.Render(logs)
+}
+
+func renderMainContainer(c container) string {
+	return renderContainer(c, &renderOpts{
+		logsMaxLength: 80,
+		logsPrefix:    "",
+	})
 }
