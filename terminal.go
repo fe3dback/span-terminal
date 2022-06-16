@@ -3,277 +3,238 @@ package terminal
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"sort"
 	"sync"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
 
-// how many logs can be buffered
-const bufferCapacity = 8
+// logs will be updated at least once per interval
+const forceUpdateInterval = time.Millisecond * 50
 
-// how many lines for each span
-const maxLines = 4
+// pause between normal updates
+const pauseBetweenUpdates = time.Millisecond * 5
 
-// long lines will be trimmed
-const maxLineLength = 80
+type Terminal struct {
+	opts terminalOpts
 
-// max updates rate
-const updateInterval = time.Millisecond * 5
+	isANSITerminal bool
+	rootSpans      []*Span
+	active         bool
+	watchCtx       context.Context
+	watchCancel    func()
 
-type (
-	Terminal struct {
-		controlCtx context.Context
+	stdoutBuffer  *bytes.Buffer
+	realStdout    *os.File
+	termOs        *termOS
+	logsContainer container
+	watchFinished chan struct{}
 
-		topSpans    spans
-		buffer      actionChan
-		sleepTo     time.Time
-		tea         *tea.Program
-		lastMessage []byte
-		finished    bool
-
-		bufferedText map[spanID]*container
-
-		sync.RWMutex
-	}
-
-	actionChan = chan action
-)
-
-func NewTerminal(controlCtx context.Context, target *os.File) *Terminal {
-	t := &Terminal{
-		controlCtx: controlCtx,
-
-		topSpans:     make(spans),
-		buffer:       make(actionChan, bufferCapacity),
-		bufferedText: make(map[spanID]*container),
-		sleepTo:      time.Now(),
-		finished:     false,
-	}
-
-	lipgloss.SetColorProfile(termenv.ANSI)
-	renderer := tea.NewProgram(t, tea.WithOutput(target))
-	t.tea = renderer
-
-	go t.watch()
-	return t
+	mux sync.RWMutex
 }
 
-func (t *Terminal) shutdown() {
-	if t.finished {
+func NewTerminal(initializers ...OptsInitializer) *Terminal {
+	opt := &terminalOpts{
+		containerMaxLines: OptDefaultContainerMaxLines,
+		stdoutMaxLines:    OptDefaultStdoutMaxLines,
+		renderOpts:        defaultRenderOpts,
+	}
+	for _, initializer := range initializers {
+		initializer(opt)
+	}
+
+	return &Terminal{
+		opts: *opt,
+
+		isANSITerminal: termenv.ColorProfile() != termenv.Ascii,
+		rootSpans:      make([]*Span, 0),
+		active:         false,
+
+		stdoutBuffer:  bytes.NewBuffer(nil),
+		realStdout:    os.Stdout,
+		termOs:        newTermOs(os.Stdout),
+		logsContainer: newMultiLineContainer(opt.stdoutMaxLines),
+	}
+}
+
+func (t *Terminal) capture() {
+	t.mux.Lock()
+	defer t.mux.Unlock()
+
+	if t.active {
 		return
 	}
 
-	t.finished = true
+	if !t.isANSITerminal {
+		return
+	}
 
-	t.rebuildView()
-	time.Sleep(time.Millisecond * 100)
-	t.tea.Kill()
-	time.Sleep(time.Millisecond * 100)
+	// create watch context
+	ctx, cancel := context.WithCancel(context.Background())
+
+	t.watchCtx = ctx
+	t.watchCancel = cancel
+
+	lipgloss.SetColorProfile(termenv.ANSI) // force set to simple ANSI
+	t.stdoutBuffer.Reset()
+	t.watchFinished = make(chan struct{}) // this channel will be closed, after watch is completed
+
+	t.active = true
+	go t.redirectAllStdoutToContainer()
+	go t.watch()
 }
 
-func (t *Terminal) span(ctx context.Context, title string) (context.Context, *Span) {
-	if t.finished {
+func (t *Terminal) redirectAllStdoutToContainer() {
+	bufioStdout(t.watchCtx, func(message bufioMessage) {
+		if message.err != nil {
+			if !errors.Is(message.err, io.EOF) {
+				_, _ = fmt.Fprint(os.Stderr, fmt.Sprintf("failed buffer stdout: %v", message.err))
+			}
+
+			return
+		}
+
+		t.stdoutBuffer.Write(message.data)
+		t.stdoutBuffer.WriteString("\n")
+		t.logsContainer.write(string(message.data))
+	})
+}
+
+func (t *Terminal) release() {
+	t.mux.Lock()
+	defer t.mux.Unlock()
+
+	if !t.active {
+		return
+	}
+
+	t.active = false
+
+	time.Sleep(time.Millisecond * 500) // wait for all io term events done
+	t.watchCancel()
+
+	// wait for watch is finished gracefully
+	<-t.watchFinished
+}
+
+func (t *Terminal) span(ctx context.Context, opts ...StartOpt) (context.Context, *Span) {
+	if !t.active {
 		return ctx, nil
 	}
 
 	parent := spanFromContext(ctx)
-	newSpan := newSpan(t, parent, title)
 
-	t.RWMutex.Lock()
-	if newSpan.isRoot() {
-		t.topSpans[newSpan.id] = newSpan
+	currentDepth := depth(0)
+	if parent != nil {
+		currentDepth = parent.depth + 1
 	}
-	t.bufferedText[newSpan.id] = newContainer(maxLines)
-	t.RWMutex.Unlock()
+
+	newSpan := newSpan(
+		parent,
+		newContainer(currentDepth, t.opts.containerMaxLines),
+		!currentDepth.isRoot(),
+	)
+
+	for _, enrich := range opts {
+		enrich(newSpan)
+	}
+
+	if currentDepth == depth(0) {
+		t.rootSpans = append(t.rootSpans, newSpan)
+	}
 
 	return contextWithSpan(ctx, newSpan), newSpan
 }
 
 func (t *Terminal) watch() {
-	teaQuit := make(chan struct{})
-	finished := false
+	watching := true
+
+	ticker := time.NewTicker(forceUpdateInterval)
+	spanUpdated := make(chan struct{}, 1)
+	nextUpdateAt := time.Now()
 
 	go func() {
-		err := t.tea.Start()
-		if err != nil {
-			finished = true
-			fmt.Printf("failed init terminal: %v\n", err)
-			return
-		}
+		lastUpdatedAt := time.Now()
 
-		<-teaQuit
-		t.rebuildView()
-		t.tea.Kill()
+		for watching {
+			latestSpanChangeAt := t.latestSpanChangeAt()
+			if latestSpanChangeAt.After(lastUpdatedAt) {
+				lastUpdatedAt = latestSpanChangeAt
+				spanUpdated <- struct{}{}
+			}
+
+			time.Sleep(time.Millisecond)
+		}
 	}()
 
-	for {
-		if t.finished || finished {
-			break
-		}
-
+	for watching {
 		select {
-		case <-t.controlCtx.Done():
-			finished = true
+		case <-t.watchCtx.Done():
+			watching = false
+			t.update()                         // last update
+			time.Sleep(time.Millisecond * 500) // wait for last term update
+			t.dumpBufferedStdout()             // restore buffered logs to stdout
+			time.Sleep(time.Millisecond * 500) // wait for buffer writing
+			close(t.watchFinished)             // signal that we can finish restoring terminal
 			break
-		case act := <-t.buffer:
-			if t.updateState(act) {
-				t.rebuildView()
+		case <-ticker.C:
+			t.update() // force update
+			break
+		case <-spanUpdated:
+			if time.Now().Before(nextUpdateAt) {
+				break
 			}
-		}
-	}
 
-	t.finished = true
-	close(teaQuit)
-}
-
-func (t *Terminal) updateState(act action) bool {
-	if act.Type() != actionTypeSpanEnd && time.Now().Before(t.sleepTo) {
-		// do not update so often
-		return false
-	}
-
-	if act.Type() == actionTypeSpanEnd {
-		// update status
-		return true
-	}
-
-	t.sleepTo = time.Now().Add(updateInterval)
-
-	// -- update span containers
-
-	t.RWMutex.RLock()
-	cont, exist := t.bufferedText[act.SpanID()]
-	t.RWMutex.RUnlock()
-
-	if exist {
-		cont.append(act.String())
-	}
-
-	return true
-}
-
-func (t *Terminal) rebuildView() {
-	var buf bytes.Buffer
-	t.renderSpans(&buf, t.topSpans)
-
-	t.lastMessage = buf.Bytes()
-}
-
-func (t *Terminal) renderSpans(buf *bytes.Buffer, list spans) {
-	sortedList := make([]*Span, 0, len(list))
-	for _, span := range list {
-		sortedList = append(sortedList, span)
-	}
-
-	sort.Slice(sortedList, func(i, j int) bool {
-		return sortedList[i].id < sortedList[j].id
-	})
-
-	for _, span := range sortedList {
-		if span == nil {
-			continue
-		}
-
-		if span.isFinished() {
-			buf.Write(t.outputDone(span))
-			continue
-		}
-
-		buf.Write(t.outputProcess(span, !span.hasActiveChild()))
-
-		if span.hasActiveChild() {
-			t.renderSpans(buf, span.child)
-			continue
-		}
-
-		t.RWMutex.RLock()
-		cont, exist := t.bufferedText[span.id]
-		t.RWMutex.RUnlock()
-
-		if !exist {
-			continue
-		}
-
-		for _, s := range cont.content() {
-			buf.Write(t.outputLine(s))
+			nextUpdateAt = time.Now().Add(pauseBetweenUpdates)
+			t.update() // something changed
+			break
 		}
 	}
 }
 
-func (t *Terminal) outputDone(s *Span) []byte {
-	return []byte(
-		styleStatusDone.Render(fmt.Sprintf("[ %5s ] %s",
-			t.formatDuration(s),
-			s.title,
-		)) + "\n",
-	)
-}
+func (t *Terminal) latestSpanChangeAt() time.Time {
+	latest := time.Time{}
 
-func (t *Terminal) formatDuration(s *Span) string {
-	took := s.endAt.Sub(s.startAt)
-
-	if took.Seconds() > 1 {
-		return fmt.Sprintf("%.0fs", took.Seconds())
-	}
-
-	return fmt.Sprintf("%dms", took.Milliseconds())
-}
-
-func (t *Terminal) outputProcess(s *Span, active bool) []byte {
-	text := s.title
-	pb := fmt.Sprintf("[ %4d%% ] ", s.percent)
-
-	percents := ""
-	if s.percent > 0 {
-		percents = styleProgressActive.Render(pb)
-	} else {
-		percents = styleProgressWait.Render(pb)
-	}
-
-	if active {
-		return []byte(percents + styleStatusActive.Render(text) + "\n")
-	}
-
-	return []byte(percents + styleStatusWait.Render(text) + "\n")
-}
-
-func (t *Terminal) outputLine(line string) []byte {
-	if len(line) > maxLineLength {
-		line = string(line[:maxLineLength-2]) + ".."
-	}
-
-	return []byte(styleStatusActive.Render("  | ") + styleLogs.Render(line) + "\n")
-}
-
-func (t *Terminal) Init() tea.Cmd {
-	return nil
-}
-
-func (t *Terminal) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
-			t.finished = true
-			return t, tea.Quit
+	for _, span := range t.rootSpans {
+		if span.changedAt.After(latest) {
+			latest = span.changedAt
 		}
 	}
 
-	return t, func() tea.Msg {
-		return true
-	}
+	return latest
 }
 
-func (t *Terminal) View() string {
-	if t == nil {
-		return ""
+func (t *Terminal) update() {
+	// clear
+	t.termOs.clear()
+	t.termOs.moveCursor(1, 1)
+
+	// render main logs
+	if t.active {
+		// don`t show normal stdout, because we
+		// dump in normal mode right after release
+		t.termOs.print(renderMainContainer(t.logsContainer) + "\n")
 	}
 
-	return string(t.lastMessage)
+	// render top spans
+	for _, rootSpan := range mostRelevantSpans(t.rootSpans, t.opts.renderOpts.spansMaxRoots) {
+		t.termOs.print(renderSpanWithOptions(rootSpan, t.opts.renderOpts))
+	}
+
+	// output to term
+	t.termOs.flush()
+}
+
+func (t *Terminal) dumpBufferedStdout() {
+	// print all captured and hidden messages and logs
+	// back to stdout
+	_, _ = t.realStdout.WriteString("\n")
+	_, _ = t.realStdout.Write(t.stdoutBuffer.Bytes())
+	_, _ = t.realStdout.WriteString("\n")
+	t.stdoutBuffer.Reset()
 }
