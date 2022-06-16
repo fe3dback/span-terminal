@@ -1,13 +1,17 @@
 package terminal
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
 
-	tm "github.com/buger/goterm"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // logs will be updated at least once per interval
@@ -16,41 +20,46 @@ const forceUpdateInterval = time.Millisecond * 50
 // pause between normal updates
 const pauseBetweenUpdates = time.Millisecond * 5
 
-// todo: capture stdout to container
-// todo: close todos
-
 type Terminal struct {
-	writer      *os.File
-	optMaxLines int
+	opts terminalOpts
 
-	rootSpans     []*Span
-	active        bool
-	watchCtx      context.Context
-	watchCancel   func()
+	isANSITerminal bool
+	rootSpans      []*Span
+	active         bool
+	watchCtx       context.Context
+	watchCancel    func()
+
+	stdoutBuffer  *bytes.Buffer
 	realStdout    *os.File
+	termOs        *termOS
 	logsContainer container
+	watchFinished chan struct{}
 
 	mux sync.RWMutex
 }
 
-func NewTerminal(initializers ...TerminalInitializer) *Terminal {
-	t := &Terminal{
-		writer:      os.Stdout,
-		optMaxLines: 4,
-
-		rootSpans:     make([]*Span, 0),
-		active:        false,
-		realStdout:    os.Stdout,
-		logsContainer: newMultiLineContainer(6),
+func NewTerminal(initializers ...OptsInitializer) *Terminal {
+	opt := &terminalOpts{
+		containerMaxLines: OptDefaultContainerMaxLines,
+		stdoutMaxLines:    OptDefaultStdoutMaxLines,
+		renderOpts:        defaultRenderOpts,
 	}
-
-	tm.Output = bufio.NewWriter(t.realStdout)
-
 	for _, initializer := range initializers {
-		initializer(t)
+		initializer(opt)
 	}
 
-	return t
+	return &Terminal{
+		opts: *opt,
+
+		isANSITerminal: termenv.ColorProfile() != termenv.Ascii,
+		rootSpans:      make([]*Span, 0),
+		active:         false,
+
+		stdoutBuffer:  bytes.NewBuffer(nil),
+		realStdout:    os.Stdout,
+		termOs:        newTermOs(os.Stdout),
+		logsContainer: newMultiLineContainer(opt.stdoutMaxLines),
+	}
 }
 
 func (t *Terminal) capture() {
@@ -61,11 +70,19 @@ func (t *Terminal) capture() {
 		return
 	}
 
+	if !t.isANSITerminal {
+		return
+	}
+
 	// create watch context
 	ctx, cancel := context.WithCancel(context.Background())
 
 	t.watchCtx = ctx
 	t.watchCancel = cancel
+
+	lipgloss.SetColorProfile(termenv.ANSI) // force set to simple ANSI
+	t.stdoutBuffer.Reset()
+	t.watchFinished = make(chan struct{}) // this channel will be closed, after watch is completed
 
 	t.active = true
 	go t.redirectAllStdoutToContainer()
@@ -75,9 +92,15 @@ func (t *Terminal) capture() {
 func (t *Terminal) redirectAllStdoutToContainer() {
 	bufioStdout(t.watchCtx, func(message bufioMessage) {
 		if message.err != nil {
+			if !errors.Is(message.err, io.EOF) {
+				_, _ = fmt.Fprint(os.Stderr, fmt.Sprintf("failed buffer stdout: %v", message.err))
+			}
+
 			return
 		}
 
+		t.stdoutBuffer.Write(message.data)
+		t.stdoutBuffer.WriteString("\n")
 		t.logsContainer.write(string(message.data))
 	})
 }
@@ -91,10 +114,12 @@ func (t *Terminal) release() {
 	}
 
 	t.active = false
+
+	time.Sleep(time.Millisecond * 500) // wait for all io term events done
 	t.watchCancel()
 
-	// wait for closing watch and current loop processing
-	time.Sleep(time.Millisecond * 500)
+	// wait for watch is finished gracefully
+	<-t.watchFinished
 }
 
 func (t *Terminal) span(ctx context.Context, opts ...StartOpt) (context.Context, *Span) {
@@ -111,7 +136,7 @@ func (t *Terminal) span(ctx context.Context, opts ...StartOpt) (context.Context,
 
 	newSpan := newSpan(
 		parent,
-		newContainer(currentDepth, t.optMaxLines),
+		newContainer(currentDepth, t.opts.containerMaxLines),
 		!currentDepth.isRoot(),
 	)
 
@@ -151,9 +176,14 @@ func (t *Terminal) watch() {
 		select {
 		case <-t.watchCtx.Done():
 			watching = false
+			t.update()                         // last update
+			time.Sleep(time.Millisecond * 500) // wait for last term update
+			t.dumpBufferedStdout()             // restore buffered logs to stdout
+			time.Sleep(time.Millisecond * 500) // wait for buffer writing
+			close(t.watchFinished)             // signal that we can finish restoring terminal
 			break
 		case <-ticker.C:
-			t.update()
+			t.update() // force update
 			break
 		case <-spanUpdated:
 			if time.Now().Before(nextUpdateAt) {
@@ -161,7 +191,7 @@ func (t *Terminal) watch() {
 			}
 
 			nextUpdateAt = time.Now().Add(pauseBetweenUpdates)
-			t.update()
+			t.update() // something changed
 			break
 		}
 	}
@@ -180,24 +210,31 @@ func (t *Terminal) latestSpanChangeAt() time.Time {
 }
 
 func (t *Terminal) update() {
-	t.mux.Lock()
-	defer t.mux.Unlock()
-
-	// todo: custom terminal output/buffer lib
-
 	// clear
-	tm.Clear()
-	tm.MoveCursor(1, 1)
+	t.termOs.clear()
+	t.termOs.moveCursor(1, 1)
 
 	// render main logs
-	_, _ = tm.Print(renderMainContainer(t.logsContainer))
+	if t.active {
+		// don`t show normal stdout, because we
+		// dump in normal mode right after release
+		t.termOs.print(renderMainContainer(t.logsContainer) + "\n")
+	}
 
 	// render top spans
-	for _, rootSpan := range t.rootSpans {
-		spanContent := renderSpanWithOptions(rootSpan) // todo: opts
-		_, _ = tm.Print(spanContent)
+	for _, rootSpan := range mostRelevantSpans(t.rootSpans, t.opts.renderOpts.spansMaxRoots) {
+		t.termOs.print(renderSpanWithOptions(rootSpan, t.opts.renderOpts))
 	}
 
 	// output to term
-	tm.Flush()
+	t.termOs.flush()
+}
+
+func (t *Terminal) dumpBufferedStdout() {
+	// print all captured and hidden messages and logs
+	// back to stdout
+	_, _ = t.realStdout.WriteString("\n")
+	_, _ = t.realStdout.Write(t.stdoutBuffer.Bytes())
+	_, _ = t.realStdout.WriteString("\n")
+	t.stdoutBuffer.Reset()
 }

@@ -5,14 +5,14 @@ running tasks and write theirs logs in one _container_
 
 Also it automatically track execution time for each span
 
-This working on `span` concept (like in tracing)
+This based on `span`-like concept from tracing
 
 ## install
 
 Inside main.go or other setup
-```
+```go
 terminal.SetGlobalTerminal(
-    terminal.NewTerminal(terminal.WithWriter(os.Stdout)),
+    terminal.NewTerminal(), // can be customized here
 )
 
 terminal.CaptureOutput()
@@ -24,11 +24,11 @@ terminal.ReleaseOutput()
 
 ### Spans
 
-Between capture and release calls, we can start spans
+Between `CaptureOutput` and `ReleaseOutput` calls, we can start spans
 and write some logs to it, like in tracing
 
 __somewhere in code:__
-```
+```go
 func Check(ctx context.Context) (error) {
   ctx, span := terminal.StartSpan(ctx, "Some task")
   defer span.End()
@@ -52,35 +52,6 @@ func forkA(ctx context.Context) (error) {
 }
 ```
 
-### Output
+### Example of output
 
-```
-[+] Some task
-| working on dasd
-| working on ewqeqweqweqw                      
-| log in A                      
-| working on eqweqweqw                   
-                                               
- > 53ms fork B
- >  40% fork A (level 2)
-    23ms | span level 3
-         | ..
-      5s | http
-     18s | system
-      5s | generated-models
-      1s | config-http
-     98% | operations
-      5s | generated-clients
-   212ms | version
-   314ms | config-cli
-   648ms | container-cli
-     10s | interaction-kafka
-      5s | generated-restapi
-      5s | models
-    54ms | container-http
-   428ms | cli
-      4s | interaction
-   163ms | generated-proto-models
-      7s | repository
-   592ms | inmem
-```
+[![asciicast](https://asciinema.org/a/lAWXPqIZfii8p01zOpDrW76Pr.svg)](https://asciinema.org/a/lAWXPqIZfii8p01zOpDrW76Pr)

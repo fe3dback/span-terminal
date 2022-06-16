@@ -2,38 +2,17 @@ package terminal
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
 
-type renderOpts struct {
-	maxRootSpans      int    // todo
-	maxChild          int    // will filter only ended todo
-	progressZeroLabel string // should be 3 chars long
-	logsMaxLength     int
-	logsPrefix        string
-}
-
-type renderOptInitializer func(*renderOpts)
-
-func renderSpanWithOptions(span *Span, optsInitializers ...renderOptInitializer) string {
+func renderSpanWithOptions(span *Span, opts renderOpts) string {
 	if span == nil {
 		return ""
 	}
 
-	opts := &renderOpts{
-		maxRootSpans:      4,
-		maxChild:          8,
-		progressZeroLabel: "...",
-		logsMaxLength:     80,
-		logsPrefix:        "| ",
-	}
-
-	for _, initializer := range optsInitializers {
-		initializer(opts)
-	}
-
-	return renderSpan(span, opts)
+	return renderSpan(span, &opts)
 }
 
 func renderSpan(span *Span, opt *renderOpts) string {
@@ -51,7 +30,7 @@ func renderSpan(span *Span, opt *renderOpts) string {
 
 func renderSpanRoot(span *Span, opt *renderOpts) string {
 	childContent := ""
-	for _, subSpan := range span.child {
+	for _, subSpan := range mostRelevantSpans(span.child, opt.spansMaxChild) {
 		childContent += "" +
 			renderSpanPadding(span) +
 			renderSpan(subSpan, opt)
@@ -62,8 +41,16 @@ func renderSpanRoot(span *Span, opt *renderOpts) string {
 		logs = renderContainer(span.container, opt) + "\n"
 	}
 
+	spanProgress := "-"
+	if span.progress > 0 {
+		spanProgress = fmt.Sprintf("%2d%%", span.progress)
+	}
+	if span.finished {
+		spanProgress = "+"
+	}
+
 	return "" +
-		styleHeader.Render("[+] "+span.title) + "\n" +
+		styleHeader.Render("["+spanProgress+"] "+span.title) + "\n" +
 		logs +
 		childContent + "\n"
 }
@@ -74,7 +61,7 @@ func renderSpanSecond(span *Span, opt *renderOpts) string {
 	}
 
 	childContent := ""
-	for _, subSpan := range span.child {
+	for _, subSpan := range mostRelevantSpans(span.child, opt.spansMaxDetails) {
 		childContent += "" +
 			renderSpanPadding(span) +
 			renderSpan(subSpan, opt)
@@ -148,8 +135,11 @@ func renderContainer(c container, opt *renderOpts) string {
 	logs := ""
 
 	for _, line := range c.content() {
-		if len(line) > opt.logsMaxLength {
-			line = line[:opt.logsMaxLength]
+		if len(line) > opt.logsMaxLength && opt.logsMaxLength > 0 {
+			half := int(math.Floor(float64(opt.logsMaxLength / 2)))
+			left := line[:half]
+			right := line[len(line)-half:]
+			line = left + " .. " + right
 		}
 
 		logs += opt.logsPrefix + line + "\n"
@@ -160,7 +150,7 @@ func renderContainer(c container, opt *renderOpts) string {
 
 func renderMainContainer(c container) string {
 	return renderContainer(c, &renderOpts{
-		logsMaxLength: 80,
+		logsMaxLength: 0,
 		logsPrefix:    "",
 	})
 }

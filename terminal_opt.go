@@ -1,19 +1,44 @@
 package terminal
 
-import "os"
+const OptDefaultContainerMaxLines = 4
+const OptDefaultStdoutMaxLines = 8
 
 type (
-	TerminalInitializer = func(*Terminal)
+	terminalOpts = struct {
+		containerMaxLines int
+		stdoutMaxLines    int
+		renderOpts        renderOpts
+	}
+
+	OptsInitializer = func(*terminalOpts)
 )
 
-func WithWriter(writer *os.File) TerminalInitializer {
-	return func(terminal *Terminal) {
-		terminal.writer = writer
+// WithContainerMaxLines set max log lines for each root span
+// default = OptDefaultContainerMaxLines
+func WithContainerMaxLines(maxLines int) OptsInitializer {
+	return func(opt *terminalOpts) {
+		opt.containerMaxLines = maxLines
 	}
 }
 
-func WithContainerMaxLines(maxLines int) TerminalInitializer {
-	return func(terminal *Terminal) {
-		terminal.optMaxLines = maxLines
+// WithStdoutMaxLines set max lines for captured stdout
+// all fmt.* and log.* functions will print to this area
+// default = OptDefaultStdoutMaxLines
+func WithStdoutMaxLines(maxLines int) OptsInitializer {
+	return func(opt *terminalOpts) {
+		opt.stdoutMaxLines = maxLines
+	}
+}
+
+// WithRenderOpts allow to customize spans printing
+func WithRenderOpts(initializers ...RenderOptInitializer) OptsInitializer {
+	return func(opts *terminalOpts) {
+		renderOpts := defaultRenderOpts
+
+		for _, initializer := range initializers {
+			initializer(&renderOpts)
+		}
+
+		opts.renderOpts = renderOpts
 	}
 }
